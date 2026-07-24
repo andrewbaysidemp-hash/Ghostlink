@@ -194,7 +194,8 @@ impl BackendRegistry {
             // Try to detect ROCm via environment variables
             let rocm_installed = std::env::var("ROCM_HOME").is_ok()
                 || std::env::var("HIP_PATH").is_ok()
-                || std::env::var("HSA_OVERRIDE_GFX_VERSION").is_ok()
+                || crate::runtime_switcher::backend_env_or_process("HSA_OVERRIDE_GFX_VERSION")
+                    .is_some()
                 || std::env::var("HIP_VISIBLE_DEVICES").is_ok();
 
             if rocm_installed {
@@ -203,8 +204,10 @@ impl BackendRegistry {
                     backend: ComputeBackend::Rocm,
                     device_name: "AMD Radeon 860M".to_string(),
                     vram_gb: Some(14.2),
-                    compute_capability: std::env::var("HSA_OVERRIDE_GFX_VERSION")
-                        .unwrap_or_else(|_| "gfx906".to_string()),
+                    compute_capability: crate::runtime_switcher::backend_env_or_process(
+                        "HSA_OVERRIDE_GFX_VERSION",
+                    )
+                    .unwrap_or_else(|| "gfx906".to_string()),
                     driver_version: "ROCm 6.1+".to_string(),
                     available: true,
                 });

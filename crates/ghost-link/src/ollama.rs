@@ -1,6 +1,6 @@
 //! Ollama inference client for real model execution
 #![allow(dead_code)]
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -327,28 +327,62 @@ impl OllamaClient {
     ) -> Result<mpsc::Receiver<Result<String, Box<dyn Error + Send + Sync>>>, Box<dyn Error>> {
         let (tx, rx) = mpsc::channel(100);
 
-        let body = resp.bytes().await?;
+        // Consume the body incrementally as chunks arrive rather than
+        // `resp.bytes().await` (which blocks until the *entire* response is
+        // buffered — defeating the point of streaming and making the first
+        // token wait for the last one). Ollama's /api/generate stream is
+        // newline-delimited JSON (`{...}\n` per token); we split on the newline
+        // byte, which is ASCII and so never lands inside a multibyte char.
+        let mut byte_stream = resp.bytes_stream();
 
         tokio::spawn(async move {
-            let text = String::from_utf8_lossy(&body);
-            for line in text.lines() {
-                if let Some(json_str) = line.strip_prefix("data: ") {
-                    if let Ok(data) = serde_json::from_str::<Value>(json_str) {
-                        if let Some(response) = data.get("response").and_then(|v| v.as_str()) {
-                            let _ = tx.send(Ok(response.to_string())).await;
-                        }
-                        if data.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            return;
-                        }
-                    }
-                } else if let Ok(data) = serde_json::from_str::<Value>(line) {
+            let mut buf: Vec<u8> = Vec::new();
+
+            // Try to forward one buffered line; returns true if the stream is
+            // done (either `done: true` seen, or the receiver was dropped).
+            async fn forward_line(
+                line: &str,
+                tx: &mpsc::Sender<Result<String, Box<dyn Error + Send + Sync>>>,
+            ) -> bool {
+                let line = line.trim();
+                if line.is_empty() {
+                    return false;
+                }
+                let json_str = line.strip_prefix("data: ").unwrap_or(line);
+                if let Ok(data) = serde_json::from_str::<Value>(json_str) {
                     if let Some(response) = data.get("response").and_then(|v| v.as_str()) {
-                        let _ = tx.send(Ok(response.to_string())).await;
+                        if !response.is_empty() && tx.send(Ok(response.to_string())).await.is_err()
+                        {
+                            return true;
+                        }
                     }
                     if data.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        return true;
+                    }
+                }
+                false
+            }
+
+            while let Some(chunk) = byte_stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                buf.extend_from_slice(&bytes);
+
+                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    if forward_line(&line, &tx).await {
                         return;
                     }
                 }
+            }
+
+            // Flush any trailing line that arrived without a closing newline.
+            if !buf.is_empty() {
+                let line = String::from_utf8_lossy(&buf);
+                let _ = forward_line(&line, &tx).await;
             }
         });
 

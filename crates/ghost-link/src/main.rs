@@ -2113,47 +2113,71 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         model_id: &str,
         models_dir: &std::path::Path,
     ) -> Result<String, String> {
+        // Optional `owner/repo:QUANT` selector — HF repo ids never contain a
+        // colon, so a trailing `:...` unambiguously names a preferred quant
+        // (e.g. `Qwen/Qwen2.5-7B-Instruct-GGUF:Q5_K_M`).
+        let (repo_id, preferred_quant) = match model_id.rsplit_once(':') {
+            Some((repo, quant)) if !quant.is_empty() && !quant.contains('/') => (repo, Some(quant)),
+            _ => (model_id, None),
+        };
+
         let client = reqwest::Client::builder()
             .user_agent("ghostlink/1.0")
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
 
-        let api_url = format!("https://huggingface.co/api/models/{}", model_id);
-        let resp = client
-            .get(&api_url)
-            .send()
-            .await
-            .map_err(|e| format!("API error: {}", e))?;
+        let mut effective_repo = repo_id.to_string();
+        let mut gguf_files = fetch_repo_gguf(&client, &effective_repo).await?;
 
-        if !resp.status().is_success() {
-            return Err(format!("Model '{}' not found on HuggingFace", model_id));
+        // Auto-resolve: the repo exists but ships no GGUF (a full-precision
+        // safetensors repo). Rather than dead-ending, search HuggingFace for a
+        // GGUF build of the *same* model and download that instead.
+        if gguf_files.is_empty() {
+            if let Some(alt) = resolve_gguf_repo(&client, repo_id).await {
+                let alt_files = fetch_repo_gguf(&client, &alt).await.unwrap_or_default();
+                if !alt_files.is_empty() {
+                    eprintln!("[download] '{repo_id}' has no GGUF; auto-resolved to '{alt}'");
+                    effective_repo = alt;
+                    gguf_files = alt_files;
+                }
+            }
         }
-
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse error: {}", e))?;
-
-        let gguf_files: Vec<String> = data
-            .get("siblings")
-            .and_then(|s| s.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|s| s.get("rfilename").and_then(|f| f.as_str()))
-                    .filter(|f| f.ends_with(".gguf"))
-                    .map(|f| f.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
 
         if gguf_files.is_empty() {
-            return Err("No GGUF files found in this repository. Try a GGUF-quantized variant (e.g. lmstudio-community/Meta-Llama-3-8B-Instruct-GGUF).".to_string());
+            return Err(format!(
+                "'{repo_id}' has no GGUF files and no GGUF build of it could be found \
+                 automatically. It's most likely a full-precision (safetensors) repo — \
+                 try a GGUF repo directly (its id usually ends in '-GGUF', e.g. \
+                 'bartowski/Llama-3.2-1B-Instruct-GGUF')."
+            ));
         }
 
-        let filename = &gguf_files[0];
+        let filename = match pick_single_gguf(&gguf_files, preferred_quant) {
+            Some(f) => f,
+            None => {
+                return Err(format!(
+                    "'{effective_repo}' has no usable single-file model GGUF — only split \
+                     multi-part shards or auxiliary files (mmproj/MTP). Ghostlink can't \
+                     download those; pick a repo with a single-file quant. (files: {})",
+                    gguf_files.join(", ")
+                ));
+            }
+        };
+
+        // If a specific quant was requested but isn't published, say so instead
+        // of silently downloading a different one.
+        if let Some(want) = preferred_quant {
+            if !filename.to_uppercase().contains(&want.to_uppercase()) {
+                return Err(format!(
+                    "'{effective_repo}' has no '{want}' quant. Available GGUF files: {}",
+                    gguf_files.join(", ")
+                ));
+            }
+        }
+
         let file_url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
-            model_id, filename
+            effective_repo, filename
         );
         // `filename` comes straight from the remote HuggingFace API response
         // (`rfilename`) and may contain nested-path separators or, in the
@@ -2584,6 +2608,13 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             }
             Err(err) => {
                 let mut backend = lock_state(&state);
+                // Drop the fresh placeholder so a bad repo/quant typo doesn't
+                // leave a phantom entry in the model list; but keep (and mark
+                // Failed) an entry that already had a local file from a prior
+                // successful download, so a failed re-download isn't destructive.
+                backend
+                    .models
+                    .retain(|m| !(m.name == model_id && m.local_path.is_empty()));
                 if let Some(model) = backend.models.iter_mut().find(|m| m.name == model_id) {
                     model.status = "Failed".to_string();
                 }
@@ -3516,6 +3547,76 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             .collect()
     }
 
+    /// Resolve a user-requested Ollama model name against what's actually
+    /// installed: exact match, then case-insensitive, then `name:` tag prefix
+    /// (so "qwen2.5" picks up "qwen2.5:3b"). Mirrors the resolver inside
+    /// `generate_once` so the streaming path accepts the same names.
+    fn resolve_ollama_model(requested: &str, available: &[String]) -> Option<String> {
+        if available.iter().any(|m| m == requested) {
+            return Some(requested.to_string());
+        }
+        if let Some(found) = available.iter().find(|m| m.eq_ignore_ascii_case(requested)) {
+            return Some(found.clone());
+        }
+        if !requested.contains(':') {
+            let prefix = format!("{}:", requested.to_ascii_lowercase());
+            if let Some(found) = available
+                .iter()
+                .find(|m| m.to_ascii_lowercase().starts_with(&prefix))
+            {
+                return Some(found.clone());
+            }
+        }
+        None
+    }
+
+    /// Open a real, incremental token stream from whichever backend is active.
+    /// Native llama-server is the primary path; Ollama is the fallback. Returns
+    /// the boxed per-token stream, or an error string if the backend couldn't
+    /// start streaming (the caller then falls back to the buffered path so a
+    /// streaming hiccup never drops the whole request).
+    async fn open_chat_token_stream(
+        gen: &GenerationParams,
+        prompt: &str,
+    ) -> Result<native_engine::NativeTokenStream, String> {
+        match gen.inference_backend {
+            InferenceBackend::Native => {
+                gen.native_engine_client
+                    .generate_stream(
+                        &gen.current_model,
+                        prompt,
+                        gen.exec_tokens,
+                        gen.temperature,
+                        gen.top_p,
+                        gen.top_k,
+                        gen.repeat_penalty,
+                    )
+                    .await
+            }
+            InferenceBackend::Ollama => {
+                let available = gen
+                    .ollama_client
+                    .list_models()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let model = resolve_ollama_model(&gen.current_model, &available)
+                    .ok_or_else(|| format!("model '{}' not found in Ollama", gen.current_model))?;
+                gen.ollama_client
+                    .generate_stream(
+                        &model,
+                        prompt,
+                        gen.temperature,
+                        gen.top_p,
+                        gen.top_k,
+                        gen.repeat_penalty,
+                        gen.exec_tokens,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
     async fn generate_once(
         state: &Arc<Mutex<BackendState>>,
         gen: &GenerationParams,
@@ -4209,6 +4310,29 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 req.message
             )
         };
+
+        // Real end-to-end token streaming (native llama-server primary, Ollama
+        // fallback). When the client asked for a stream AND no tools are enabled,
+        // forward tokens straight from the backend to the SSE response as they
+        // are generated — time-to-first-token becomes the model's real TTFT
+        // instead of "generate the whole answer, then fake a typewriter over the
+        // finished text". Tools are excluded on purpose: the ReAct tool loop
+        // needs the *complete* response to detect a tool call, so it can't stream.
+        if req.stream.unwrap_or(false) && gen.tool_schemas.is_empty() {
+            match open_chat_token_stream(&gen, &effective_prompt).await {
+                Ok(token_stream) => {
+                    let sse = token_stream.map(|item| {
+                        let token = item.unwrap_or_default();
+                        let chunk = serde_json::json!({ "token": token });
+                        Ok::<Event, Infallible>(Event::default().data(chunk.to_string()))
+                    });
+                    return Sse::new(sse).into_response();
+                }
+                Err(err) => {
+                    tracing::warn!("chat token streaming unavailable ({err}); using buffered path");
+                }
+            }
+        }
 
         let request_tracker = active_runtime_switcher().request_tracker().clone();
         request_tracker.increment().await;
@@ -5013,6 +5137,40 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         "Inference backend selected: {} (set GHOSTLINK_INFERENCE_BACKEND=native|ollama)",
         inference_backend.as_str()
     );
+
+    // Pre-flight: will native llama-server actually offload to the GPU, or
+    // silently run on CPU? Surface it loudly at every launch (same logic as
+    // `doctor`'s acceleration/gpu-offload check) so a misconfigured -ngl is
+    // caught here instead of surfacing later as mysteriously slow inference.
+    {
+        let gpu_detected = profile.acceleration_mode == ghostlink_core::host::AccelerationMode::Gpu;
+        let ngl = native_engine::NativeEngineClient::get_ngl();
+        let gpu_label = if profile.detection_source.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            profile.detection_source.clone()
+        };
+        let (status, detail, fix) = assess_gpu_offload(
+            inference_backend == InferenceBackend::Native,
+            gpu_detected,
+            &gpu_label,
+            ngl,
+        );
+        match status {
+            DoctorStatus::Fail => {
+                eprintln!("[startup][WARN] gpu-offload: {detail}");
+                if let Some(fix) = fix {
+                    eprintln!("[startup][WARN]   FIX: {fix}");
+                }
+                eprintln!(
+                    "[startup][WARN]   (run `ghost-link doctor --strict` to gate this in CI)"
+                );
+            }
+            DoctorStatus::Warn | DoctorStatus::Pass => {
+                eprintln!("[startup] gpu-offload: {detail}");
+            }
+        }
+    }
 
     let initial_model = models
         .iter()
@@ -6060,6 +6218,289 @@ fn run_optional_network_probe(target: &str, checks: &mut Vec<DoctorCheck>) {
     }
 }
 
+/// Preference order for GGUF quantizations, best default first. Q4_K_M is the
+/// sweet spot most repos ship; full-precision (fp16/bf16/f32) is ranked last
+/// because it's the largest/slowest file and almost never what a user picking
+/// "download this model" actually wants.
+const GGUF_QUANT_PREFERENCE: &[&str] = &[
+    "Q4_K_M", "IQ4_XS", "Q4_K_S", "Q5_K_M", "Q4_0", "Q5_K_S", "IQ4_NL", "Q3_K_M", "Q6_K", "Q5_0",
+    "Q8_0", "Q3_K_S", "IQ3_M", "Q2_K",
+];
+
+/// Lower is better. Ranks a GGUF filename by its quantization; full-precision
+/// files sort worst, unrecognized quants sort in the middle.
+fn gguf_quant_score(name_upper: &str) -> i32 {
+    for (i, q) in GGUF_QUANT_PREFERENCE.iter().enumerate() {
+        if name_upper.contains(q) {
+            return i as i32;
+        }
+    }
+    if name_upper.contains("FP16")
+        || name_upper.contains("F16")
+        || name_upper.contains("BF16")
+        || name_upper.contains("F32")
+    {
+        return 900;
+    }
+    500
+}
+
+/// Choose the single best `.gguf` to download from a repo's file list.
+///
+/// - Split/multi-part models (`*-00001-of-00003.gguf`) can't be fetched as a
+///   single file here, so shard files are excluded; returns `None` if the repo
+///   ships *only* split GGUF (caller reports that distinctly).
+/// - Otherwise prefers a sensible quant (see `GGUF_QUANT_PREFERENCE`) so a repo
+///   that also ships fp16 doesn't default to the largest, slowest file.
+/// - `preferred` (from a `repo:QUANT` request) wins when it matches a file.
+fn pick_single_gguf(files: &[String], preferred: Option<&str>) -> Option<String> {
+    let single: Vec<String> = files
+        .iter()
+        .filter(|f| {
+            let l = f.to_lowercase();
+            // Exclude split shards (can't be fetched as one file) and non-model
+            // auxiliary GGUFs — vision projectors (`mmproj`) and multi-token-
+            // prediction / speculative-draft modules (`mtp`) are small companion
+            // files, not the model. Picking one yields a tiny, unusable download
+            // (e.g. an 873 MB "MTP" file standing in for a 35B model).
+            !l.contains("-of-") && !l.contains("mmproj") && !l.contains("mtp")
+        })
+        .cloned()
+        .collect();
+    if single.is_empty() {
+        return None;
+    }
+    if let Some(p) = preferred {
+        let pu = p.to_uppercase();
+        if let Some(hit) = single.iter().find(|f| f.to_uppercase().contains(&pu)) {
+            return Some(hit.clone());
+        }
+    }
+    single
+        .into_iter()
+        .min_by_key(|f| (gguf_quant_score(&f.to_uppercase()), f.clone()))
+}
+
+/// Normalize a model name for fuzzy matching: lowercase, ASCII-alphanumerics
+/// only (so "Llama-3.2-1B-Instruct" and "llama3.2_1b_instruct" compare equal).
+fn normalize_model_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Publishers known for well-formed GGUF conversions; used only to break ties
+/// toward a trustworthy repo when auto-resolving a safetensors repo to GGUF.
+const TRUSTED_GGUF_PUBLISHERS: &[&str] = &[
+    "bartowski",
+    "lmstudio-community",
+    "unsloth",
+    "hugging-quants",
+    "maziyarpanahi",
+    "thebloke",
+    "qwen",
+    "ggml-org",
+    "mradermacher",
+    "second-state",
+    "microsoft",
+    "google",
+];
+
+/// From HuggingFace search hits `(repo_id, downloads)`, choose the best GGUF
+/// repo that is the *same model* as `shortname`. Prefers multi-quant repos (so
+/// a good default quant can then be chosen), then trusted publishers, then
+/// download count. Rejects repos that add a model-identity qualifier
+/// (uncensored/abliterated/…) the request didn't have, so a base model never
+/// silently resolves to a modified one. Pure, for unit testing.
+fn rank_gguf_repo_candidate(candidates: &[(String, u64)], shortname: &str) -> Option<String> {
+    let sn = normalize_model_name(shortname);
+    if sn.is_empty() {
+        return None;
+    }
+    const VARIANT_MARKERS: &[&str] = &["uncensored", "abliterated", "nsfw", "deabliterated"];
+    const QUANT_TOKENS: &[&str] = &[
+        "q2", "q3", "q4", "q5", "q6", "q8", "iq1", "iq2", "iq3", "iq4", "fp16", "f16", "bf16",
+        "f32",
+    ];
+    let sn_has_variant = VARIANT_MARKERS.iter().any(|v| sn.contains(v));
+    // Auto-resolution downloads from a repo the user didn't name, so hold it to
+    // a trust bar: a known-good publisher, or enough downloads that the wider
+    // community has vetted it. Without this, an obscure re-upload (broken,
+    // mislabeled, or malicious) would be fetched automatically just for having
+    // a matching name and the most downloads among junk.
+    const MIN_COMMUNITY_DOWNLOADS: u64 = 10_000;
+
+    let mut best: Option<(i64, String)> = None;
+    for (id, downloads) in candidates {
+        let name = id.rsplit('/').next().unwrap_or(id);
+        let nn = normalize_model_name(name);
+        if !nn.contains(&sn) {
+            continue; // not the same model family
+        }
+        if !sn_has_variant && VARIANT_MARKERS.iter().any(|v| nn.contains(v)) {
+            continue; // don't swap in a modified variant the user didn't ask for
+        }
+        let owner = id.split('/').next().unwrap_or("").to_lowercase();
+        let is_trusted = TRUSTED_GGUF_PUBLISHERS.contains(&owner.as_str());
+        if !is_trusted && *downloads < MIN_COMMUNITY_DOWNLOADS {
+            continue; // below the trust bar — never auto-download this one
+        }
+
+        let extra = nn.replacen(&sn, "", 1);
+        let pins_quant = QUANT_TOKENS.iter().any(|q| extra.contains(q));
+
+        let mut score: i64 = 0;
+        if !pins_quant {
+            score += 1_000_000; // multi-quant repo -> we can pick Q4_K_M ourselves
+        }
+        if is_trusted {
+            score += 100_000;
+        }
+        score += (*downloads).min(90_000) as i64; // capped so tiers dominate
+
+        if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+            best = Some((score, id.clone()));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Fetch a repo's `.gguf` filenames from the HuggingFace API. `Err` on a
+/// missing repo or network/parse failure; `Ok(empty)` when the repo exists but
+/// ships no GGUF (i.e. a safetensors repo).
+async fn fetch_repo_gguf(client: &reqwest::Client, repo: &str) -> Result<Vec<String>, String> {
+    let api_url = format!("https://huggingface.co/api/models/{}", repo);
+    let resp = client
+        .get(&api_url)
+        .send()
+        .await
+        .map_err(|e| format!("API error: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("Model '{}' not found on HuggingFace", repo));
+    }
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+    Ok(data
+        .get("siblings")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.get("rfilename").and_then(|f| f.as_str()))
+                .filter(|f| f.ends_with(".gguf"))
+                .map(|f| f.to_string())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Search HuggingFace for a GGUF build of the model named by `requested_repo`
+/// (used when the requested repo itself has no GGUF). Returns the chosen repo id.
+async fn resolve_gguf_repo(client: &reqwest::Client, requested_repo: &str) -> Option<String> {
+    let shortname = requested_repo.rsplit('/').next().unwrap_or(requested_repo);
+    let url = format!(
+        "https://huggingface.co/api/models?search={}&filter=gguf&sort=downloads&direction=-1&limit=20",
+        shortname
+    );
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let arr: serde_json::Value = resp.json().await.ok()?;
+    let candidates: Vec<(String, u64)> = arr
+        .as_array()?
+        .iter()
+        .filter_map(|m| {
+            let id = m
+                .get("id")
+                .or_else(|| m.get("modelId"))
+                .and_then(|v| v.as_str())?;
+            let dl = m.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0);
+            Some((id.to_string(), dl))
+        })
+        .collect();
+    rank_gguf_repo_candidate(&candidates, shortname)
+}
+
+/// Decide whether native `llama-server` will actually offload to the GPU, or
+/// silently run on CPU — the #1 cause of "inference is horribly slow" that a
+/// green `doctor` otherwise says nothing about. Pure (no hardware access) so it
+/// can be unit-tested exhaustively.
+///
+/// `ngl` is the value ghost-link will pass to `llama-server -ngl`:
+/// `0` = CPU-only, `-1` = let llama-server auto-offload, `>0` = that many layers.
+fn assess_gpu_offload(
+    backend_is_native: bool,
+    gpu_detected: bool,
+    gpu_label: &str,
+    ngl: i32,
+) -> (DoctorStatus, String, Option<String>) {
+    if !backend_is_native {
+        return (
+            DoctorStatus::Pass,
+            "inference backend is 'ollama'; GPU offload is managed by the Ollama server \
+             (verify with `ollama ps`), not ghost-link's -ngl"
+                .to_string(),
+            None,
+        );
+    }
+
+    match (gpu_detected, ngl) {
+        // GPU present but offload disabled: the exact silent-CPU trap.
+        (true, 0) => (
+            DoctorStatus::Fail,
+            format!(
+                "GPU detected ({gpu_label}) but -ngl resolves to 0 (CPU-only): \
+                 llama-server will NOT offload to the GPU"
+            ),
+            Some(
+                "Unset GHOSTLINK_VRAM_GB (or set it >= 4) or set GHOSTLINK_LLAMA_NGL to -1 \
+                 (auto) or a positive layer count"
+                    .to_string(),
+            ),
+        ),
+        // GPU present and offloading (auto -1 or explicit N).
+        (true, n) => (
+            DoctorStatus::Pass,
+            format!(
+                "GPU {gpu_label} detected; llama-server -ngl {n} ({})",
+                if n < 0 {
+                    "auto: offload all layers it can"
+                } else {
+                    "explicit layer count"
+                }
+            ),
+            None,
+        ),
+        // No GPU but offload explicitly requested: likely a misconfiguration.
+        (false, n) if n > 0 => (
+            DoctorStatus::Warn,
+            format!(
+                "GHOSTLINK_LLAMA_NGL requests {n} GPU layer(s) but no GPU was detected; \
+                 llama-server may error or fall back to CPU"
+            ),
+            Some(
+                "If a GPU is present but undetected, set GHOSTLINK_GPU_NAME + GHOSTLINK_VRAM_GB; \
+                 otherwise unset GHOSTLINK_LLAMA_NGL"
+                    .to_string(),
+            ),
+        ),
+        // No GPU at all: CPU by design, not a silent fallback — warn, don't fail.
+        (false, _) => (
+            DoctorStatus::Warn,
+            "no GPU detected; inference will run on CPU (expected to be slow for 7B+ models)"
+                .to_string(),
+            Some(
+                "If you have a GPU, set GHOSTLINK_GPU_NAME / GHOSTLINK_VRAM_GB / \
+                 GHOSTLINK_COMPUTE_CAPABILITY so it is used"
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
 fn print_doctor_report(options: &DoctorOptions) -> Result<()> {
     let mut checks: Vec<DoctorCheck> = Vec::new();
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -6424,6 +6865,34 @@ fn print_doctor_report(options: &DoctorOptions) -> Result<()> {
         }
     }
 
+    // Acceleration: will native llama-server actually use the GPU, or silently
+    // fall back to CPU? Nothing else in doctor covers this, and silent CPU
+    // offload is the single biggest "inference is horribly slow" cause.
+    {
+        let profile = detect_runtime_profile("doctor-accel");
+        let gpu_detected = profile.acceleration_mode == ghostlink_core::host::AccelerationMode::Gpu;
+        // Matches the server's effective default: native unless explicitly ollama.
+        let backend_is_native = std::env::var("GHOSTLINK_INFERENCE_BACKEND")
+            .map(|v| !v.trim().eq_ignore_ascii_case("ollama"))
+            .unwrap_or(true);
+        let ngl = native_engine::NativeEngineClient::get_ngl();
+        let gpu_label = if profile.detection_source.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            profile.detection_source.clone()
+        };
+        let (status, detail, fix) =
+            assess_gpu_offload(backend_is_native, gpu_detected, &gpu_label, ngl);
+        push_doctor_check(
+            &mut checks,
+            "acceleration",
+            "gpu-offload",
+            status,
+            detail,
+            fix,
+        );
+    }
+
     println!(
         "Ghost-Link Doctor Report
 "
@@ -6433,7 +6902,13 @@ fn print_doctor_report(options: &DoctorOptions) -> Result<()> {
 "
     );
 
-    for area in ["environment", "readiness", "accessibility", "accuracy"] {
+    for area in [
+        "environment",
+        "readiness",
+        "accessibility",
+        "accuracy",
+        "acceleration",
+    ] {
         println!("{}:", area);
         for check in checks.iter().filter(|check| check.area == area) {
             println!(
@@ -7185,6 +7660,193 @@ mod protocol {
 mod tests {
     use super::*;
     use ghostlink_core::host::{AccelerationMode, RuntimeProfile};
+
+    #[test]
+    fn gpu_offload_assessment_flags_silent_cpu_fallback() {
+        // The exact silent-CPU trap: a GPU is present but -ngl resolves to 0.
+        // Under `doctor --strict` this FAIL is what makes the command exit
+        // nonzero instead of quietly passing while inference crawls on CPU.
+        let (status, detail, fix) = assess_gpu_offload(true, true, "RTX 4090", 0);
+        assert_eq!(status, DoctorStatus::Fail);
+        assert!(detail.contains("CPU-only"));
+        assert!(fix.is_some());
+
+        // GPU present with auto (-1) or explicit (>0) offload => PASS.
+        assert_eq!(
+            assess_gpu_offload(true, true, "RTX 4090", -1).0,
+            DoctorStatus::Pass
+        );
+        assert_eq!(
+            assess_gpu_offload(true, true, "RTX 4090", 24).0,
+            DoctorStatus::Pass
+        );
+
+        // No GPU => CPU by design, a WARN (slow) rather than a silent-fallback FAIL.
+        assert_eq!(
+            assess_gpu_offload(true, false, "", -1).0,
+            DoctorStatus::Warn
+        );
+        // No GPU but layers explicitly requested => WARN (misconfig).
+        assert_eq!(
+            assess_gpu_offload(true, false, "", 24).0,
+            DoctorStatus::Warn
+        );
+
+        // Ollama backend: ghost-link's -ngl doesn't apply, so never a FAIL here.
+        assert_eq!(
+            assess_gpu_offload(false, true, "RTX 4090", 0).0,
+            DoctorStatus::Pass
+        );
+    }
+
+    #[test]
+    fn gguf_picker_prefers_q4km_and_skips_fp16_and_shards() {
+        // Repo that also ships fp16 (alphabetically first) — must NOT pick it.
+        let qwen = vec![
+            "qwen2.5-0.5b-instruct-fp16.gguf".to_string(),
+            "qwen2.5-0.5b-instruct-q2_k.gguf".to_string(),
+            "qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string(),
+            "qwen2.5-0.5b-instruct-q5_k_m.gguf".to_string(),
+            "qwen2.5-0.5b-instruct-q8_0.gguf".to_string(),
+        ];
+        assert_eq!(
+            pick_single_gguf(&qwen, None).as_deref(),
+            Some("qwen2.5-0.5b-instruct-q4_k_m.gguf")
+        );
+
+        // lmstudio-style: alphabetical [0] is IQ3_M; the good default is Q4_K_M.
+        let llama = vec![
+            "Meta-Llama-3-8B-Instruct-IQ3_M.gguf".to_string(),
+            "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf".to_string(),
+            "Meta-Llama-3-8B-Instruct-Q5_K_M.gguf".to_string(),
+        ];
+        assert_eq!(
+            pick_single_gguf(&llama, None).as_deref(),
+            Some("Meta-Llama-3-8B-Instruct-Q4_K_M.gguf")
+        );
+
+        // Explicit quant request (repo:QUANT) overrides the default.
+        assert_eq!(
+            pick_single_gguf(&llama, Some("q5_k_m")).as_deref(),
+            Some("Meta-Llama-3-8B-Instruct-Q5_K_M.gguf")
+        );
+
+        // Split-only repo => None, so the caller can report it distinctly.
+        let split = vec![
+            "big-Q4_K_M-00001-of-00003.gguf".to_string(),
+            "big-Q4_K_M-00002-of-00003.gguf".to_string(),
+            "big-Q4_K_M-00003-of-00003.gguf".to_string(),
+        ];
+        assert_eq!(pick_single_gguf(&split, None), None);
+
+        // Mixed: the single-file quant wins over the split set.
+        let mixed = vec![
+            "m-Q4_K_M-00001-of-00002.gguf".to_string(),
+            "m-Q4_K_M-00002-of-00002.gguf".to_string(),
+            "m-Q6_K.gguf".to_string(),
+        ];
+        assert_eq!(
+            pick_single_gguf(&mixed, None).as_deref(),
+            Some("m-Q6_K.gguf")
+        );
+
+        // Auxiliary files (MTP module, vision projector) are not the model.
+        // A repo shipping only those has nothing usable to download.
+        let aux_only = vec![
+            "qwen3-35b-a3b-Q4_K_M-MTP.gguf".to_string(),
+            "mmproj-model-f16.gguf".to_string(),
+        ];
+        assert_eq!(pick_single_gguf(&aux_only, None), None);
+        // ...but the real model file is still chosen when present alongside them.
+        let with_model = vec![
+            "model-Q4_K_M-MTP.gguf".to_string(),
+            "model-Q4_K_M.gguf".to_string(),
+            "mmproj-f16.gguf".to_string(),
+        ];
+        assert_eq!(
+            pick_single_gguf(&with_model, None).as_deref(),
+            Some("model-Q4_K_M.gguf")
+        );
+    }
+
+    #[test]
+    fn gguf_repo_resolver_picks_multiquant_trusted_build() {
+        // Real HF search results for "Llama-3.2-1B-Instruct" (by downloads).
+        let candidates = vec![
+            (
+                "hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF".to_string(),
+                453_080u64,
+            ),
+            ("bartowski/Llama-3.2-1B-Instruct-GGUF".to_string(), 227_693),
+            (
+                "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF".to_string(),
+                118_236,
+            ),
+            (
+                "MaziyarPanahi/Llama-3.2-1B-Instruct-GGUF".to_string(),
+                58_636,
+            ),
+            (
+                "mradermacher/Llama-3.2-1B-Instruct-Uncensored-i1-GGUF".to_string(),
+                4_404,
+            ),
+        ];
+        // Multi-quant + trusted wins over higher-download single-quant repos.
+        assert_eq!(
+            rank_gguf_repo_candidate(&candidates, "Llama-3.2-1B-Instruct").as_deref(),
+            Some("bartowski/Llama-3.2-1B-Instruct-GGUF")
+        );
+
+        // A base request must never silently resolve to an "Uncensored" variant.
+        let only_variant = vec![(
+            "mradermacher/Llama-3.2-1B-Instruct-Uncensored-GGUF".to_string(),
+            9_999u64,
+        )];
+        assert_eq!(
+            rank_gguf_repo_candidate(&only_variant, "Llama-3.2-1B-Instruct"),
+            None
+        );
+        // ...but if the user explicitly asked for that variant, it's allowed.
+        assert_eq!(
+            rank_gguf_repo_candidate(&only_variant, "Llama-3.2-1B-Instruct-Uncensored").as_deref(),
+            Some("mradermacher/Llama-3.2-1B-Instruct-Uncensored-GGUF")
+        );
+
+        // Unrelated models are ignored.
+        let unrelated = vec![("someone/Mistral-7B-Instruct-GGUF".to_string(), 1_000_000u64)];
+        assert_eq!(
+            rank_gguf_repo_candidate(&unrelated, "Llama-3.2-1B-Instruct"),
+            None
+        );
+
+        // Trust floor: name matches, but every candidate is an obscure,
+        // low-download community re-upload from an untrusted owner => refuse to
+        // auto-resolve (real case: a fake "Qwen3.6-35B-A3B-FP8" that only had
+        // sketchy re-uploads like `eme/...-GUFF`).
+        let sketchy = vec![
+            (
+                "eme/Qwen3.6-35B-A3B-FP8-Q4_K_M-MTP-GUFF".to_string(),
+                897u64,
+            ),
+            ("jokobaba/Qwen3.6-35B-A3B-FP8-Q4_K_M-GGUF".to_string(), 174),
+            (
+                "yangthecoder/Qwen3.6-35B-A3B-FP8-Q4_K_M-GGUF".to_string(),
+                169,
+            ),
+        ];
+        assert_eq!(
+            rank_gguf_repo_candidate(&sketchy, "Qwen3.6-35B-A3B-FP8"),
+            None
+        );
+
+        // A widely-downloaded community repo (>= 10k) is trusted enough even if
+        // the owner isn't on the allowlist.
+        let popular_community = vec![("randomuser/Gemma-2-9B-it-GGUF".to_string(), 50_000u64)];
+        assert_eq!(
+            rank_gguf_repo_candidate(&popular_community, "Gemma-2-9B-it").as_deref(),
+            Some("randomuser/Gemma-2-9B-it-GGUF")
+        );
+    }
     use std::net::TcpListener;
 
     fn args(items: &[&str]) -> impl Iterator<Item = String> {

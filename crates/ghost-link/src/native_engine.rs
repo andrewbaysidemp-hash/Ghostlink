@@ -5,11 +5,20 @@
 
 #![allow(dead_code)]
 
+use futures::{Stream, StreamExt};
+use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep as tokio_sleep;
+
+/// Boxed, incremental token stream. Same shape as `ollama::OllamaStream` so the
+/// chat handler can treat either backend uniformly. Each item is one delta
+/// fragment (not the full response) as it arrives from llama-server.
+pub type NativeTokenStream =
+    Pin<Box<dyn Stream<Item = Result<String, Box<dyn Error + Send + Sync>>> + Send>>;
 
 #[derive(Debug, Clone)]
 pub struct NativeGeneration {
@@ -288,7 +297,7 @@ impl NativeEngineClient {
     /// 1. `GHOSTLINK_LLAMA_NGL` env var
     /// 2. Auto-detect from `GHOSTLINK_VRAM_GB` env var (set by launch scripts)
     /// 3. `-1` — let llama-server decide (offload all layers it can)
-    fn get_ngl() -> i32 {
+    pub(crate) fn get_ngl() -> i32 {
         if let Ok(val) = std::env::var("GHOSTLINK_LLAMA_NGL") {
             if let Ok(n) = val.trim().parse::<i32>() {
                 return n;
@@ -545,6 +554,11 @@ impl NativeEngineClient {
             for arg in args {
                 cmd.arg(arg);
             }
+            // Apply backend-specific env overrides (GPU-selection vars set by a
+            // runtime backend switch) explicitly to the child instead of via the
+            // process environment. These override any inherited value of the
+            // same key.
+            cmd.envs(crate::runtime_switcher::backend_env_snapshot());
             cmd.stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null());
@@ -972,6 +986,119 @@ impl NativeEngineClient {
         }
 
         Err("llama_server returned empty content".to_string())
+    }
+
+    /// Stream tokens from llama-server's OpenAI-compatible
+    /// `/v1/chat/completions` endpoint with `stream: true`, forwarding each
+    /// `choices[0].delta.content` fragment the instant it arrives.
+    ///
+    /// This is the real-latency path: time-to-first-token becomes the model's
+    /// actual TTFT (~tens of ms) instead of "generate the entire response, then
+    /// hand it back". The non-streaming `generate*` methods above buffer the
+    /// whole completion before returning, which is what made chat feel frozen
+    /// until the answer was fully done.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_stream(
+        &self,
+        model: &str,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+        repeat_penalty: f32,
+    ) -> Result<NativeTokenStream, String> {
+        let base_url = Self::get_llama_base_url();
+        let chat_url = format!("{base_url}/v1/chat/completions");
+
+        // Same system prompt as generate_with_llama_server: models have no
+        // clock, so give them the current local date/time.
+        let system_prompt = format!(
+            "You are a helpful assistant. Current local date and time: {}.",
+            chrono::Local::now().format("%A, %B %d, %Y, %H:%M")
+        );
+
+        let payload = serde_json::json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature.clamp(0.0, 2.0),
+            "top_p": top_p.clamp(0.0, 1.0),
+            "top_k": top_k.clamp(1, 200),
+            "repeat_penalty": repeat_penalty.clamp(0.0, 2.0),
+            "stream": true
+        });
+
+        let resp = self
+            .http
+            .clone()
+            .post(&chat_url)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("llama_server stream request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "llama_server stream failed with status {status}: {body}"
+            ));
+        }
+
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<String, Box<dyn Error + Send + Sync>>>(100);
+        let mut byte_stream = resp.bytes_stream();
+
+        // Parse the SSE body incrementally. llama-server emits one
+        // `data: {...}\n` line per token chunk and a final `data: [DONE]`.
+        // We split on the newline byte (ASCII, never inside a multibyte UTF-8
+        // char) so decoding a completed line is always valid.
+        tokio::spawn(async move {
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = byte_stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                buf.extend_from_slice(&bytes);
+
+                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let line = line.trim();
+                    let Some(data) = line.strip_prefix("data: ") else {
+                        continue;
+                    };
+                    if data == "[DONE]" {
+                        return;
+                    }
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(content) = value
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|c| c.get("delta"))
+                            .and_then(|d| d.get("content"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if !content.is_empty()
+                                && tx.send(Ok(content.to_string())).await.is_err()
+                            {
+                                // Receiver (the SSE response) was dropped — client
+                                // disconnected. Stop pulling from llama-server.
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 }
 

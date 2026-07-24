@@ -2,12 +2,60 @@
 //! Implements graceful backend switching with request draining, environment updates, and process restart
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::backend_registry::{BackendRegistry, ComputeBackend};
+
+/// Process-wide, thread-safe store of backend-specific environment overrides.
+///
+/// Backend switching used to call `std::env::set_var`/`remove_var` directly.
+/// Those mutate the process-global environment table, which is a data race
+/// against the ~100 `std::env::var` reads elsewhere in the server running on
+/// other Tokio worker threads (and is `unsafe` as of the 2024 edition for
+/// exactly that reason). `handle_switch_backend` is a live HTTP route, so the
+/// mutation genuinely raced those reads.
+///
+/// Instead we keep the overrides here and (a) apply them explicitly to the
+/// inference child processes we spawn (see `native_engine`'s `build_cmd`) and
+/// (b) consult them during backend detection (see `backend_registry`). Nothing
+/// mutates the process environment at runtime anymore.
+static BACKEND_ENV_OVERRIDES: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+
+fn backend_env_overrides() -> &'static RwLock<HashMap<String, String>> {
+    BACKEND_ENV_OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Snapshot of the current backend env overrides, for applying to a spawned
+/// child `Command` via `Command::envs(...)` so inference subprocesses still
+/// receive backend-specific GPU-selection vars.
+pub fn backend_env_snapshot() -> HashMap<String, String> {
+    backend_env_overrides()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Resolve `key` from the backend overrides first, then the process
+/// environment. Use this (instead of `std::env::var`) wherever a value that
+/// backend switching can set is read in-process.
+///
+/// Currently that's only the Windows ROCm detection path in `backend_registry`,
+/// so this is dead on other targets — kept `pub` + allowed rather than
+/// cfg-gated so the store's read API stays in one place.
+#[allow(dead_code)]
+pub fn backend_env_or_process(key: &str) -> Option<String> {
+    if let Some(v) = backend_env_overrides()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+    {
+        return Some(v.clone());
+    }
+    std::env::var(key).ok()
+}
 
 /// Configuration for runtime switching behavior
 #[derive(Debug, Clone)]
@@ -135,8 +183,11 @@ impl EnvironmentManager {
             return Ok(());
         };
 
+        let mut overrides = backend_env_overrides()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         for (key, value) in env_vars {
-            std::env::set_var(key, value);
+            overrides.insert(key.clone(), value.clone());
         }
 
         Ok(())
@@ -156,8 +207,11 @@ impl EnvironmentManager {
             return Ok(());
         };
 
+        let mut overrides = backend_env_overrides()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         for key in env_vars.keys() {
-            std::env::remove_var(key);
+            overrides.remove(key);
         }
 
         Ok(())
@@ -317,18 +371,23 @@ mod tests {
 
         manager.set_backend_env(&ComputeBackend::Cpu).unwrap();
 
+        // Values land in the in-process override store, not the process
+        // environment (which would race the server's other threads).
         assert_eq!(
-            std::env::var("OLLAMA_NUM_THREAD").ok(),
+            backend_env_or_process("OLLAMA_NUM_THREAD"),
             Some("16".to_string())
         );
         assert_eq!(
-            std::env::var("OLLAMA_GPU_MEMORY").ok(),
+            backend_env_or_process("OLLAMA_GPU_MEMORY"),
             Some("0".to_string())
         );
 
-        // Cleanup
-        std::env::remove_var("OLLAMA_NUM_THREAD");
-        std::env::remove_var("OLLAMA_GPU_MEMORY");
+        // Cleanup: drop the overrides so the process-wide store doesn't leak
+        // into other tests or a real spawn.
+        manager.restore_env(&ComputeBackend::Cpu).unwrap();
+        let snapshot = backend_env_snapshot();
+        assert!(!snapshot.contains_key("OLLAMA_NUM_THREAD"));
+        assert!(!snapshot.contains_key("OLLAMA_GPU_MEMORY"));
     }
 
     #[tokio::test]
